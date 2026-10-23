@@ -21,10 +21,10 @@
     const CONFIG = {
         // Smooth scrolling takes priority over aggressive optimization.
         optimizeLongArticleFeeds: true,
-        watchDynamicFeeds: false,
-        lazyImages: false,
-        lazyIframes: false,
-        asyncImageDecoding: false,
+        watchDynamicFeeds: true,
+        lazyImages: true,
+        lazyIframes: true,
+        asyncImageDecoding: true,
 
         // Optional features have strict limits.
         minimumArticlesPerFeed: 10,
