@@ -1,39 +1,47 @@
 
 /// remia-global-performance.js
 /*
- * Remia Global Performance v2.0
- * uBlock Origin custom scriptlet for Firefox / Zen Browser.
+ * Remia Global Performance v2.1 - Smooth Scrolling Edition
+ * uBlock Origin custom scriptlet | Firefox / Zen Browser
  *
- * IMPORTANT: Keep the resource token above unchanged when replacing v1.
- * uBO filter: /^.+$/##+js(remia-global-performance)
+ * Filter:
+ *   /^.+$/##+js(remia-global-performance)
  *
- * Reduces potential offscreen rendering work on long article feeds.
- * Lightly improves media loading hints when requests have not yet begun.
- * Does NOT block/defer third-party scripts, stylesheets or browser APIs.
+ * Safety changes from v2.0:
+ * - Excludes image-heavy sites (including nhentai.net).
+ * - Avoids geometry work during active scrolling.
+ * - Disables late image lazy-loading and persistent DOM observers by default.
+ * - Only applies content-visibility to simple, text-only article cards.
+ * - Small, bounded batches; measurements before style changes.
+ * - No network/JS API patches, CSS bundle changes or timer loops.
  */
 (() => {
     'use strict';
 
     const CONFIG = {
-        lazyImages: true,
-        lazyIframes: true,
-        asyncImageDecoding: true,
+        // Smooth scrolling takes priority over aggressive optimization.
         optimizeLongArticleFeeds: true,
-        watchDynamicFeeds: true,
+        watchDynamicFeeds: false,
+        lazyImages: false,
+        lazyIframes: false,
+        asyncImageDecoding: false,
 
-        minimumArticlesPerFeed: 8,
-        maxMediaToCheck: 180,
-        maxArticlesToCheck: 180,
-        maxArticlesPerPass: 64,
-        maxOptimizedArticlesTotal: 120,
-        maxObservedFeeds: 2,
-        maxDynamicItemsToCheck: 80,
-        observerLifetimeMs: 90000,
-        offscreenViewportMultiplier: 1.5,
-        idleTimeoutMs: 1400,
+        // Optional features have strict limits.
+        minimumArticlesPerFeed: 10,
+        maxArticlesToCheck: 80,
+        maxArticlesPerPass: 24,
+        maxOptimizedArticlesTotal: 48,
+        maxMediaToCheck: 40,
+        imageHeavyPageThreshold: 100,
+        minDistanceFromViewport: 2,
+        scrollQuietMs: 650,
+        maxIdleRetries: 5,
+        observerLifetimeMs: 25000,
+        maxDynamicItems: 40,
         debug: false,
 
         excludedDomains: [
+            'nhentai.net',
             'youtube.com', 'youtube-nocookie.com',
             'accounts.google.com', 'mail.google.com',
             'docs.google.com', 'drive.google.com',
@@ -48,112 +56,124 @@
     } catch (_) {
         return;
     }
+    if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
 
-    if (location.protocol !== 'http:' && location.protocol !== 'https:') {
-        return;
-    }
-
-    const hostname = location.hostname.toLowerCase();
+    const host = location.hostname.toLowerCase();
     if (CONFIG.excludedDomains.some(domain =>
-        hostname === domain || hostname.endsWith('.' + domain)
+        host === domain || host.endsWith('.' + domain)
     )) return;
+    if (/(?:^|\/)(?:login|log-in|signin|sign-in|checkout|payment|billing|auth)(?:\/|$)/i.test(location.pathname)) return;
 
-    if (/(?:^|\/)(?:login|log-in|signin|sign-in|checkout|payment|billing|auth)(?:\/|$)/i.test(
-        location.pathname
-    )) return;
-
-    const canContain = !!(
+    const supportsContainment = !!(
         typeof CSS !== 'undefined' &&
         typeof CSS.supports === 'function' &&
         CSS.supports('content-visibility', 'auto') &&
         CSS.supports('contain-intrinsic-block-size', 'auto 300px')
     );
-
-    const stats = { images: 0, iframes: 0, articles: 0, feeds: 0 };
-    const optimized = new WeakSet();
-    const observedParents = new Set();
+    const stats = { images: 0, iframes: 0, articles: 0, observedFeeds: 0 };
+    const processed = new WeakSet();
     const observers = [];
-    let mediaScanned = false;
-    let secondPassScheduled = false;
-    let dynamicChecked = 0;
-    let dynamicIdlePending = false;
-    let observerStopTimer = 0;
-    const dynamicQueue = new Set();
+    let observedCount = 0;
+    let stopped = false;
+    let lastScroll = -Infinity;
+    let observerTimer = 0;
+
+    const clock = () => (typeof performance !== 'undefined' && performance.now)
+        ? performance.now() : Date.now();
+
+    function onScroll() {
+        lastScroll = clock();
+    }
+    window.addEventListener('scroll', onScroll, { passive: true, capture: true });
+
+    function scrolling() {
+        return clock() - lastScroll < CONFIG.scrollQuietMs;
+    }
 
     function log(message) {
         if (CONFIG.debug) {
-            console.info('[Remia Global v2]', message, { ...stats });
+            console.info('[Remia Global v2.1] ' + message, { ...stats });
         }
     }
 
-    function idle(callback) {
+    function stop() {
+        if (stopped) return;
+        stopped = true;
+        for (const observer of observers) observer.disconnect();
+        observers.length = 0;
+        if (observerTimer) clearTimeout(observerTimer);
+        window.removeEventListener('scroll', onScroll, true);
+        log('Stopped and cleaned up');
+    }
+
+    function scheduleQuietWork(callback, attempt = 0) {
+        if (stopped) return;
+        const run = () => {
+            if (stopped) return;
+            if (document.hidden || scrolling()) {
+                if (!document.hidden && attempt < CONFIG.maxIdleRetries) {
+                    window.setTimeout(() => scheduleQuietWork(callback, attempt + 1), 320);
+                } else if (observers.length === 0) {
+                    stop();
+                }
+                return;
+            }
+            try {
+                callback();
+            } catch (error) {
+                if (CONFIG.debug) console.warn('[Remia Global v2.1]', error);
+                stop();
+            }
+        };
         if (typeof window.requestIdleCallback === 'function') {
-            window.requestIdleCallback(callback, {
-                timeout: CONFIG.idleTimeoutMs
-            });
+            window.requestIdleCallback(run, { timeout: 1400 });
         } else {
-            window.setTimeout(callback, 40);
+            window.setTimeout(run, 120);
         }
     }
 
-    function threshold() {
-        return Math.max(900,
-            (window.innerHeight || 800) * CONFIG.offscreenViewportMultiplier
-        );
+    function offscreenHeight(element, minimumWidth, minimumHeight, maximumHeight) {
+        const box = element.getBoundingClientRect();
+        const viewHeight = window.innerHeight || 800;
+        if (box.top < viewHeight * CONFIG.minDistanceFromViewport ||
+            box.width < minimumWidth || box.height < minimumHeight ||
+            box.height > maximumHeight) return 0;
+        return Math.round(box.height);
     }
 
-    function measureOffscreen(element, minWidth, minHeight, maxHeight) {
-        const rect = element.getBoundingClientRect();
-        if (rect.top <= threshold() || rect.width < minWidth ||
-            rect.height < minHeight || rect.height > maxHeight) {
-            return 0;
-        }
-        return Math.round(rect.height);
-    }
-
-    function optimizeMediaOnce() {
-        if (mediaScanned) return;
-        mediaScanned = true;
+    function optimizeMedia() {
         if (!CONFIG.lazyImages && !CONFIG.lazyIframes) return;
-
-        // A late loading="lazy" hint cannot undo a request already started.
-        // Native resource hints set by the website are never overwritten.
-        const media = document.querySelectorAll(
-            'img:not([loading]), iframe:not([loading])'
-        );
-        const pending = [];
-        const max = Math.min(media.length, CONFIG.maxMediaToCheck);
-
-        for (let i = 0; i < max; i++) {
-            const element = media[i];
-            const image = element.localName === 'img';
-            if (image ? !CONFIG.lazyImages : !CONFIG.lazyIframes) continue;
-            if (element.getAttribute('fetchpriority') === 'high') continue;
-            if (element.closest('header, nav, [role="banner"]')) continue;
-
-            if (image) {
-                if ((!element.hasAttribute('src') &&
-                    !element.hasAttribute('srcset')) || element.complete) continue;
-            } else {
-                if (!element.hasAttribute('src') ||
-                    element.hasAttribute('srcdoc') ||
-                    /\bautoplay\b/i.test(element.getAttribute('allow') || '')) {
-                    continue;
+        const candidates = [];
+        let remaining = CONFIG.maxMediaToCheck;
+        for (const tag of ['img', 'iframe']) {
+            if (tag === 'img' && !CONFIG.lazyImages) continue;
+            if (tag === 'iframe' && !CONFIG.lazyIframes) continue;
+            const collection = document.getElementsByTagName(tag);
+            const length = Math.min(collection.length, remaining);
+            for (let i = 0; i < length; i++) {
+                const item = collection[i];
+                if (item.hasAttribute('loading') ||
+                    item.getAttribute('fetchpriority') === 'high' ||
+                    item.closest('header, nav, [role="banner"]')) continue;
+                // Avoid layout shifts from lazy-loading unsized media.
+                if (!item.hasAttribute('width') || !item.hasAttribute('height')) continue;
+                if (tag === 'img' && (item.complete ||
+                    (!item.hasAttribute('src') && !item.hasAttribute('srcset')))) continue;
+                if (tag === 'iframe' && (!item.hasAttribute('src') ||
+                    item.hasAttribute('srcdoc'))) continue;
+                if (offscreenHeight(item, 8, 8, Infinity)) {
+                    candidates.push({ item, tag });
                 }
             }
-
-            if (!measureOffscreen(element, 4, 4, Infinity)) continue;
-            pending.push({ element, image });
+            remaining -= length;
+            if (remaining <= 0) break;
         }
-
-        // Make DOM changes only after all layout measurements are finished.
-        for (const { element, image } of pending) {
-            if (!element.isConnected || element.hasAttribute('loading')) continue;
-            element.setAttribute('loading', 'lazy');
-            if (image) {
-                if (CONFIG.asyncImageDecoding &&
-                    !element.hasAttribute('decoding')) {
-                    element.setAttribute('decoding', 'async');
+        for (const { item, tag } of candidates) {
+            if (!item.isConnected || item.hasAttribute('loading')) continue;
+            item.setAttribute('loading', 'lazy');
+            if (tag === 'img') {
+                if (CONFIG.asyncImageDecoding && !item.hasAttribute('decoding')) {
+                    item.setAttribute('decoding', 'async');
                 }
                 stats.images++;
             } else {
@@ -162,187 +182,127 @@
         }
     }
 
-    function safeArticle(article, parent) {
-        if (!article.isConnected || article.parentElement !== parent ||
-            optimized.has(article)) return false;
-        if (article.style.getPropertyValue('content-visibility') ||
-            article.style.getPropertyValue('contain-intrinsic-block-size')) {
-            return false;
-        }
-        // Skip items containing complex or actively interactive elements.
-        if (article.querySelector(
-            'video, audio, canvas, iframe, [contenteditable], ' +
-            'input, textarea, select, [role="textbox"]'
-        )) return false;
-        return true;
+    function safeTextArticle(article, parent) {
+        return article.isConnected && article.parentElement === parent &&
+            !processed.has(article) &&
+            !article.style.getPropertyValue('content-visibility') &&
+            !article.style.getPropertyValue('contain-intrinsic-block-size') &&
+            // Skip image-heavy and interactive cards; these are likely to
+            // reflow or redraw when they enter the viewport.
+            !article.querySelector(
+                'img, picture, video, audio, canvas, iframe, input, textarea, select, ' +
+                '[contenteditable], [role="textbox"]'
+            );
     }
 
-    function applyArticleCandidates(articles, parent, limit) {
-        const pending = [];
-        for (const article of articles) {
-            if (pending.length >= limit ||
-                stats.articles + pending.length >= CONFIG.maxOptimizedArticlesTotal) {
-                break;
-            }
-            if (!safeArticle(article, parent)) continue;
-            const height = measureOffscreen(article, 240, 110, 1500);
-            if (height) pending.push({ article, height });
+    function optimizeArticles(items, parent) {
+        const candidates = [];
+        const remaining = Math.min(
+            CONFIG.maxArticlesPerPass,
+            CONFIG.maxOptimizedArticlesTotal - stats.articles
+        );
+        if (remaining <= 0) return;
+        for (const article of items) {
+            if (candidates.length >= remaining) break;
+            if (!safeTextArticle(article, parent)) continue;
+            const height = offscreenHeight(article, 260, 160, 1400);
+            if (height) candidates.push({ article, height });
         }
-
-        for (const { article, height } of pending) {
-            if (!article.isConnected || optimized.has(article)) continue;
-            article.style.setProperty(
-                'contain-intrinsic-block-size', 'auto ' + height + 'px'
-            );
+        // Write styles only after finishing all geometry reads.
+        for (const { article, height } of candidates) {
+            if (!article.isConnected || processed.has(article)) continue;
+            article.style.setProperty('contain-intrinsic-block-size', 'auto ' + height + 'px');
             article.style.setProperty('content-visibility', 'auto');
-            optimized.add(article);
+            processed.add(article);
             stats.articles++;
         }
     }
 
-    function stopObservers() {
-        for (const observer of observers) observer.disconnect();
-        observers.length = 0;
-        dynamicQueue.clear();
-        if (observerStopTimer) {
-            window.clearTimeout(observerStopTimer);
-            observerStopTimer = 0;
-        }
-    }
-
-    function flushDynamicQueue() {
-        dynamicIdlePending = false;
-        if (document.hidden) {
-            dynamicQueue.clear();
-            return;
-        }
-        if (stats.articles >= CONFIG.maxOptimizedArticlesTotal) {
-            stopObservers();
-            return;
-        }
-
-        // Read candidate geometry first, then write styles for each parent.
-        const groups = new Map();
-        for (const article of dynamicQueue) {
-            const parent = article.parentElement;
-            if (parent && observedParents.has(parent)) {
-                if (!groups.has(parent)) groups.set(parent, []);
-                groups.get(parent).push(article);
-            }
-        }
-        dynamicQueue.clear();
-        for (const [parent, articles] of groups) {
-            applyArticleCandidates(articles, parent, CONFIG.maxArticlesPerPass);
-        }
-        if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck ||
-            stats.articles >= CONFIG.maxOptimizedArticlesTotal) {
-            stopObservers();
-        }
-        log('Dynamic feed pass');
-    }
-
-    function queueDynamicWork() {
-        if (dynamicIdlePending || dynamicQueue.size === 0) return;
-        dynamicIdlePending = true;
-        idle(flushDynamicQueue);
-    }
-
     function watchFeed(parent) {
         if (!CONFIG.watchDynamicFeeds ||
-            observedParents.has(parent) ||
-            observedParents.size >= CONFIG.maxObservedFeeds ||
-            typeof MutationObserver === 'undefined') return;
+            typeof MutationObserver === 'undefined' ||
+            observers.length >= 1) return;
 
+        const pending = new Set();
+        let scheduled = false;
         const observer = new MutationObserver(records => {
-            if (!parent.isConnected ||
-                dynamicChecked >= CONFIG.maxDynamicItemsToCheck) {
-                observer.disconnect();
+            if (stopped || observedCount >= CONFIG.maxDynamicItems ||
+                !parent.isConnected) {
+                stop();
                 return;
             }
             for (const record of records) {
                 for (const node of record.addedNodes) {
-                    if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck) break;
+                    if (observedCount >= CONFIG.maxDynamicItems) break;
                     if (node.nodeType !== 1 ||
                         !node.matches('article, [role="article"]')) continue;
-                    dynamicChecked++;
-                    if (dynamicQueue.size < CONFIG.maxArticlesPerPass) {
-                        dynamicQueue.add(node);
-                    }
+                    observedCount++;
+                    pending.add(node);
                 }
             }
-            queueDynamicWork();
+            if (scheduled || pending.size === 0) return;
+            scheduled = true;
+            scheduleQuietWork(() => {
+                scheduled = false;
+                const added = Array.from(pending);
+                pending.clear();
+                optimizeArticles(added, parent);
+                if (observedCount >= CONFIG.maxDynamicItems ||
+                    stats.articles >= CONFIG.maxOptimizedArticlesTotal) stop();
+            });
         });
         observer.observe(parent, { childList: true });
         observers.push(observer);
-        observedParents.add(parent);
-        stats.feeds++;
-        if (!observerStopTimer) {
-            observerStopTimer = window.setTimeout(
-                stopObservers, CONFIG.observerLifetimeMs
-            );
-        }
+        stats.observedFeeds++;
+        observerTimer = window.setTimeout(stop, CONFIG.observerLifetimeMs);
     }
 
     function optimizeFeeds() {
-        if (!CONFIG.optimizeLongArticleFeeds || !canContain ||
-            stats.articles >= CONFIG.maxOptimizedArticlesTotal) return;
-
+        if (!CONFIG.optimizeLongArticleFeeds || !supportsContainment) return;
         const nodes = document.querySelectorAll(
-            'main article, [role="main"] article, ' +
-            'main [role="article"], [role="main"] [role="article"]'
+            'main article, [role="main"] article, main [role="article"], ' +
+            '[role="main"] [role="article"]'
         );
         const groups = new Map();
-        const count = Math.min(nodes.length, CONFIG.maxArticlesToCheck);
-
-        for (let i = 0; i < count; i++) {
+        const limit = Math.min(nodes.length, CONFIG.maxArticlesToCheck);
+        for (let i = 0; i < limit; i++) {
             const article = nodes[i];
             const parent = article.parentElement;
             if (!parent || parent.closest('article, [role="article"]')) continue;
             if (!groups.has(parent)) groups.set(parent, []);
             groups.get(parent).push(article);
         }
-
-        for (const [parent, articles] of groups) {
-            if (articles.length < CONFIG.minimumArticlesPerFeed) continue;
-            applyArticleCandidates(articles, parent, CONFIG.maxArticlesPerPass);
+        for (const [parent, items] of groups) {
+            if (items.length < CONFIG.minimumArticlesPerFeed) continue;
+            optimizeArticles(items, parent);
             watchFeed(parent);
         }
     }
 
-    function run() {
-        if (document.hidden) {
-            document.addEventListener('visibilitychange', function onVisible() {
-                if (!document.hidden) idle(run);
-            }, { once: true });
+    function initialPass() {
+        if (document.querySelector('input[type="password"], [contenteditable="true"]')) {
+            stop();
             return;
         }
-        try {
-            // A page with a password field is conservatively left untouched.
-            if (document.querySelector('input[type="password"]')) return;
-            optimizeMediaOnce();
-            optimizeFeeds();
-            log('Initial pass');
-        } catch (error) {
-            if (CONFIG.debug) console.warn('[Remia Global v2]', error);
+        // Many image-heavy sites already have their own lazy loader.
+        // Avoid adding competition for network and image decoding.
+        const imageCount = document.images ? document.images.length : 0;
+        if (imageCount >= CONFIG.imageHeavyPageThreshold) {
+            log('Skipped image-heavy page (' + imageCount + ' images)');
+            stop();
+            return;
         }
-
-        // One additional discovery pass accommodates late SPA hydration.
-        // No document-wide MutationObserver, URL polling or history patching.
-        if (!secondPassScheduled && observedParents.size === 0) {
-            secondPassScheduled = true;
-            window.setTimeout(() => idle(() => {
-                try { optimizeFeeds(); } catch (_) { /* noncritical */ }
-                log('Late discovery pass');
-            }), 1800);
-        }
+        optimizeMedia();
+        optimizeFeeds();
+        log('Initial pass completed');
+        if (observers.length === 0) stop();
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => idle(run), {
+        document.addEventListener('DOMContentLoaded', () => scheduleQuietWork(initialPass), {
             once: true
         });
     } else {
-        idle(run);
+        scheduleQuietWork(initialPass);
     }
-
 })();
