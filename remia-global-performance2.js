@@ -34,7 +34,7 @@
         debug: false,
 
         excludedDomains: [
-            'nhentai.net', 'youtube.com', 'youtube-nocookie.com',
+            'nhentai.net', 'youtube-nocookie.com',
             'accounts.google.com', 'mail.google.com',
             'docs.google.com', 'drive.google.com',
             'paypal.com', 'stripe.com',
